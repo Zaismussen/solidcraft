@@ -61,11 +61,19 @@
 //!   steered by the tighter bound, a round on a round took more spans and solves.
 //! - **Indices.** Knots and nets are read by checked indices (a knot or a coordinate
 //!   outside reads NaN, which shows in the result); the fork's indices stay inside.
+//! - **Centred partials (#2690).** A rational face's partials, and a rational curve's
+//!   derivatives, are enclosed in the centred form: the quotient about the value at the
+//!   box's middle, then the mean-value form of each derivative, met with the direct
+//!   enclosure. The direct quotient widens by the numerator's size times the weight's
+//!   spread, which grows with the distance from the origin and does not shrink with a
+//!   partial that is nearly constant. The centred form's excess over the range is of
+//!   the box's square, so Krawczyk's test proves the spans the geometry asks for.
 
+use super::affine::{Aff, NOISE, S_NOISE};
 use super::definition_box::{definition_partials_over_box, GnDefFace, GnDefs};
 use super::form::{binom, gn_form_normalized, GnSectionFormT};
 use super::interval::{cmax, cmin, round_down, round_up, Ivl};
-use super::series::{v_hull, GnScalar, Ser, Trunc, VSer, MAX_E, MAX_S, TAYLOR, V3, VZ};
+use super::series::{v_hull, GnScalar, Ser, Trunc, VSer, MAX_E, MAX_K, MAX_S, TAYLOR, V3, VZ};
 use super::station::{
     ders_basis, gn_evaluate, gn_evaluate_vn, gn_jacobian, gn_solve_station_counted, gn_top_jets,
     knot, smax, solve4, span, GnStation, GnSystem, Nurbs, Partials,
@@ -171,9 +179,12 @@ const IZ: Ivl = Ivl::new(0.0, 0.0);
 /// `piece` (the span of the knots it starts at; `None`: each piece `s` covers) for every
 /// parameter in `s`, enclosed (hulled over the pieces).
 ///
+/// Not the fork's direct quotient (#2690): each piece is [`piece_derivs_centred`].
+///
 /// # Errors
 ///
-/// `SM_ERR` when no piece covers `s`.
+/// `SM_ERR` when no piece covers `s`, or the centred form and the direct enclosure do
+/// not meet.
 pub fn curve_derivs_over(
     cn: &NurbsCurve,
     s: Ivl,
@@ -183,7 +194,6 @@ pub fn curve_derivs_over(
     let k0 = piece.unwrap_or_else(|| span(&cn.u, cn.p, cn.n, s.lo));
     let k1 = piece.unwrap_or_else(|| span(&cn.u, cn.p, cn.n, s.hi));
     let fixed = piece.is_some();
-    let p = cn.p;
     let mut first = true;
     let mut rd = vec![VZ; ld + 1];
     for k in k0..=k1 {
@@ -192,7 +202,7 @@ pub fn curve_derivs_over(
         if !has_span {
             continue; // a knot repeated: no span
         }
-        let a = if k == p || fixed {
+        let a = if k == cn.p || fixed {
             s.lo
         } else {
             cmax(s.lo, knot(&cn.u, ki))
@@ -207,73 +217,7 @@ pub fn curve_derivs_over(
         if a > b || (a == b && s.lo < s.hi) {
             continue;
         }
-        // the homogeneous curve is a polynomial of degree p on the span: its derivatives
-        // over [a, b] are its Taylor polynomials at the middle m, from exact point
-        // derivatives (rounding only)
-        let m = 0.5 * (a + b);
-        let nb = ders_basis(&cn.u, k, p, Ivl::from(m), p);
-        let mut am = vec![VZ; p + 1];
-        let mut wm = vec![IZ; p + 1];
-        for d in 0..=p {
-            let (mut x, mut y, mut z, mut w) = (IZ, IZ, IZ, IZ);
-            for j in 0..=p {
-                // k >= p (sm_Span)
-                let li = 4 * (k + j - p);
-                let nj = at2(&nb, d, j, IZ);
-                x = x + nj * Ivl::from(pw_at(&cn.pw, li));
-                y = y + nj * Ivl::from(pw_at(&cn.pw, li + 1));
-                z = z + nj * Ivl::from(pw_at(&cn.pw, li + 2));
-                w = w + nj * Ivl::from(pw_at(&cn.pw, li + 3));
-            }
-            if let (Some(ad), Some(wd)) = (am.get_mut(d), wm.get_mut(d)) {
-                *ad = V3 { x, y, z };
-                *wd = w;
-            }
-        }
-        let dt = Ivl::new(a, b) - Ivl::from(m);
-        let mut av = vec![VZ; ld + 1];
-        let mut wv = vec![IZ; ld + 1];
-        for d in 0..=ld {
-            let (mut x, mut y, mut z, mut w, mut pwr) = (IZ, IZ, IZ, IZ, Ivl::from(1.0));
-            let mut f = 1.0_f64;
-            for j in d..=p {
-                if j > d {
-                    pwr = pwr * dt;
-                    f *= (j - d) as f64;
-                }
-                let c = pwr * (Ivl::from(1.0) / Ivl::from(f));
-                let aj = at1(&am, j, VZ);
-                x = x + aj.x * c;
-                y = y + aj.y * c;
-                z = z + aj.z * c;
-                w = w + at1(&wm, j, IZ) * c;
-            }
-            if let (Some(ad), Some(wd)) = (av.get_mut(d), wv.get_mut(d)) {
-                *ad = V3 { x, y, z };
-                *wd = w;
-            }
-        }
-        let w0 = at1(&wv, 0, IZ);
-        let mut cv = vec![VZ; ld + 1];
-        for d in 0..=ld {
-            let mut v = at1(&av, d, VZ);
-            let mut c = 1.0_f64;
-            for i in 1..=d {
-                c = c * (d - i + 1) as f64 / i as f64;
-                let wi = at1(&wv, i, IZ);
-                let cdi = at1(&cv, d - i, VZ);
-                v.x = v.x - Ivl::from(c) * wi * cdi.x;
-                v.y = v.y - Ivl::from(c) * wi * cdi.y;
-                v.z = v.z - Ivl::from(c) * wi * cdi.z;
-            }
-            if let Some(cd) = cv.get_mut(d) {
-                *cd = V3 {
-                    x: v.x / w0,
-                    y: v.y / w0,
-                    z: v.z / w0,
-                };
-            }
-        }
+        let cv = piece_derivs_centred(cn, k, a, b, ld)?;
         for (r, c) in rd.iter_mut().zip(&cv) {
             if first {
                 *r = *c;
@@ -289,17 +233,243 @@ pub fn curve_derivs_over(
     Ok(rd)
 }
 
+/// The derivatives `D[0..=ld]` of the curve's polynomial piece k over `[a, b]`, enclosed
+/// directly: the homogeneous curve's Taylor polynomials at the middle m (it is of degree p
+/// there), from exact point derivatives (rounding only), then the quotient (the NURBS
+/// book's A4.2) in intervals, about the point at m (as [`nurbs_partials_direct`]). A point
+/// `a = b` is enclosed to rounding.
+fn piece_derivs_direct(cn: &NurbsCurve, k: usize, a: f64, b: f64, ld: usize) -> Vec<V3<Ivl>> {
+    let p = cn.p;
+    // the homogeneous curve is a polynomial of degree p on the span: its derivatives
+    // over [a, b] are its Taylor polynomials at the middle m, from exact point
+    // derivatives (rounding only)
+    let m = 0.5 * (a + b);
+    let nb = ders_basis(&cn.u, k, p, Ivl::from(m), p);
+    let mut am = vec![VZ; p + 1];
+    let mut wm = vec![IZ; p + 1];
+    for d in 0..=p {
+        let (mut x, mut y, mut z, mut w) = (IZ, IZ, IZ, IZ);
+        for j in 0..=p {
+            // k >= p (sm_Span)
+            let li = 4 * (k + j - p);
+            let nj = at2(&nb, d, j, IZ);
+            x = x + nj * Ivl::from(pw_at(&cn.pw, li));
+            y = y + nj * Ivl::from(pw_at(&cn.pw, li + 1));
+            z = z + nj * Ivl::from(pw_at(&cn.pw, li + 2));
+            w = w + nj * Ivl::from(pw_at(&cn.pw, li + 3));
+        }
+        if let (Some(ad), Some(wd)) = (am.get_mut(d), wm.get_mut(d)) {
+            *ad = V3 { x, y, z };
+            *wd = w;
+        }
+    }
+    // the quotient about c, the point at the middle (rounded; any c is exact)
+    let c = {
+        let (a0, w0) = (at1(&am, 0, VZ), at1(&wm, 0, IZ).mid());
+        let c = [a0.x.mid() / w0, a0.y.mid() / w0, a0.z.mid() / w0];
+        if c.iter().all(|x| x.is_finite()) {
+            c
+        } else {
+            [0.0; 3]
+        }
+    };
+    let [cx, cy, cz] = c.map(Ivl::from);
+    for (ad, &wd) in am.iter_mut().zip(&wm) {
+        ad.x = ad.x - cx * wd;
+        ad.y = ad.y - cy * wd;
+        ad.z = ad.z - cz * wd;
+    }
+    let dt = Ivl::new(a, b) - Ivl::from(m);
+    let mut av = vec![VZ; ld + 1];
+    let mut wv = vec![IZ; ld + 1];
+    for d in 0..=ld {
+        let (mut x, mut y, mut z, mut w, mut pwr) = (IZ, IZ, IZ, IZ, Ivl::from(1.0));
+        let mut f = 1.0_f64;
+        for j in d..=p {
+            if j > d {
+                pwr = pwr * dt;
+                f *= (j - d) as f64;
+            }
+            let scale = pwr * (Ivl::from(1.0) / Ivl::from(f));
+            let aj = at1(&am, j, VZ);
+            x = x + aj.x * scale;
+            y = y + aj.y * scale;
+            z = z + aj.z * scale;
+            w = w + at1(&wm, j, IZ) * scale;
+        }
+        if let (Some(ad), Some(wd)) = (av.get_mut(d), wv.get_mut(d)) {
+            *ad = V3 { x, y, z };
+            *wd = w;
+        }
+    }
+    let w0 = at1(&wv, 0, IZ);
+    let mut cv = vec![VZ; ld + 1];
+    for d in 0..=ld {
+        let mut v = at1(&av, d, VZ);
+        let mut coeff = 1.0_f64;
+        for i in 1..=d {
+            coeff = coeff * (d - i + 1) as f64 / i as f64;
+            let wi = at1(&wv, i, IZ);
+            let cdi = at1(&cv, d - i, VZ);
+            v.x = v.x - Ivl::from(coeff) * wi * cdi.x;
+            v.y = v.y - Ivl::from(coeff) * wi * cdi.y;
+            v.z = v.z - Ivl::from(coeff) * wi * cdi.z;
+        }
+        if let Some(cd) = cv.get_mut(d) {
+            *cd = V3 {
+                x: v.x / w0,
+                y: v.y / w0,
+                z: v.z / w0,
+            };
+        }
+    }
+    if let Some(c0) = cv.first_mut() {
+        c0.x = c0.x + cx;
+        c0.y = c0.y + cy;
+        c0.z = c0.z + cz;
+    }
+    cv
+}
+
+/// [`piece_derivs_direct`] in the centred (mean value) form: `D_d(m) + D_(d+1)([a, b])
+/// (s - m)`, the derivatives at the middle enclosed on that point and the next one's over
+/// the interval, within the direct enclosure. The direct quotient widens with the interval
+/// by the numerator's size times w's spread, which the derivatives' own ranges need not
+/// (a line's tangent is constant, its rational quotient's is not): the centred form's
+/// excess over the range is of the interval's square.
+///
+/// # Errors
+///
+/// `SM_ERR` where the two enclosures do not meet (they hold the same derivatives: only a
+/// curve that is not finite there).
+fn piece_derivs_centred(
+    cn: &NurbsCurve,
+    k: usize,
+    a: f64,
+    b: f64,
+    ld: usize,
+) -> Result<Vec<V3<Ivl>>> {
+    if a >= b {
+        return Ok(piece_derivs_direct(cn, k, a, b, ld));
+    }
+    let wide = piece_derivs_direct(cn, k, a, b, ld + 1);
+    let m = 0.5 * (a + b);
+    let mid = piece_derivs_direct(cn, k, m, m, ld);
+    let dt = Ivl::new(a, b) - Ivl::from(m);
+    let mut out = vec![VZ; ld + 1];
+    for (d, o) in out.iter_mut().enumerate() {
+        let (cm, cn1, cw) = (at1(&mid, d, VZ), at1(&wide, d + 1, VZ), at1(&wide, d, VZ));
+        let comps = [
+            (cm.x, cn1.x, cw.x),
+            (cm.y, cn1.y, cw.y),
+            (cm.z, cn1.z, cw.z),
+        ];
+        let mut got = [IZ; 3];
+        for (g, (mv, n1, w)) in got.iter_mut().zip(comps) {
+            *g = centred_within(mv + n1 * dt, w)?;
+        }
+        let [x, y, z] = got;
+        *o = V3 { x, y, z };
+    }
+    Ok(out)
+}
+
+/// The centred form `c` within the direct enclosure `w` (both hold the value: they meet).
+///
+/// # Errors
+///
+/// `SM_ERR` where they do not meet.
+fn centred_within(c: Ivl, w: Ivl) -> Result<Ivl> {
+    let x = Ivl::new(cmax(c.lo, w.lo), cmin(c.hi, w.hi));
+    let meet = x.lo <= x.hi;
+    if !meet {
+        return Err(SolidError::sm_err(OP));
+    }
+    Ok(x)
+}
+
 /// `sm_NurbsPartialsOverPiece`: the partials `P[a][b]`, `a + b <= lk`, of one polynomial
-/// piece (spans `ku`, `kv`) over `[ua, ub] x [va, vb]`, enclosed: the homogeneous surface's
-/// Taylor polynomials at the box's middle, from exact point derivatives (it is of degree
-/// p, q there), then the rational quotient's (the NURBS book's A4.4) in intervals.
+/// piece (spans `ku`, `kv`) over `[ua, ub] x [va, vb]`, enclosed.
+///
+/// Not upstream (#2690): the fork takes them directly, the homogeneous surface's Taylor
+/// polynomials at the box's middle (exact) and the rational quotient (the NURBS book's
+/// A4.4) in intervals. Interval arithmetic does not see that the numerator `A` and the
+/// weight w vary together, so each quotient widens by about the numerator's size times w's
+/// relative spread over the box: `|P| |dw| / w` for the point, measured from the origin
+/// however near the box the face lies, and `|P_ab| |dw| / w` for each partial, which its
+/// range need not have (a cylinder's partial along its axis is constant; its quotient's
+/// enclosure is not). The Jacobian of the blend's system over a feet's box then comes out
+/// far wider than its range, Krawczyk's test fails on spans the geometry does not need,
+/// and the certificate subdivides to make up for it. Here:
+///
+/// - the quotient is taken about the point at the box's middle, c: `P - c = (A - c w) /
+///   w`, an identity for any c, with `A - c w` the homogeneous surface moved by -c, so the
+///   point's excess is `|P - c| |dw| / w`, of the box's size, wherever the face lies;
+/// - each partial is in the centred (mean value) form, `P_ab(m) + P_(a+1)b(box) du +
+///   P_a(b+1)(box) dv`, the partials at the middle on that point and the next order's over
+///   the box, within the direct enclosure: its excess over the range is of the box's
+///   square.
 ///
 /// # Errors
 ///
 /// `SM_ERR` where the weights are not proved positive over the box ("a face's weights are
-/// not positive over a box").
+/// not positive over a box"), or the centred form and the direct enclosure do not meet.
 #[allow(clippy::too_many_arguments)]
 pub fn nurbs_partials_over_piece(
+    cn: &Nurbs,
+    ku: usize,
+    kv: usize,
+    ua: f64,
+    ub: f64,
+    va: f64,
+    vb: f64,
+    lk: usize,
+) -> Result<Partials<Ivl>> {
+    let point = ua >= ub && va >= vb;
+    // the centred form takes the next order over the box (a series holds MAX_K at most)
+    if point || lk >= MAX_K {
+        return nurbs_partials_direct(cn, ku, kv, ua, ub, va, vb, lk);
+    }
+    let wide = nurbs_partials_direct(cn, ku, kv, ua, ub, va, vb, lk + 1)?;
+    let (um, vm) = (0.5 * (ua + ub), 0.5 * (va + vb));
+    let mid = nurbs_partials_direct(cn, ku, kv, um, um, vm, vm, lk)?;
+    let du = Ivl::new(ua, ub) - Ivl::from(um);
+    let dv = Ivl::new(va, vb) - Ivl::from(vm);
+    let mut out = Partials::default();
+    for a in 0..=lk {
+        for b in 0..=(lk - a) {
+            let (cm, cu, cv, cw) = (
+                mid.at(a, b),
+                wide.at(a + 1, b),
+                wide.at(a, b + 1),
+                wide.at(a, b),
+            );
+            let comps = [
+                (cm.x, cu.x, cv.x, cw.x),
+                (cm.y, cu.y, cv.y, cw.y),
+                (cm.z, cu.z, cv.z, cw.z),
+            ];
+            let mut got = [IZ; 3];
+            for (g, (mv, u, v, w)) in got.iter_mut().zip(comps) {
+                *g = centred_within(mv + u * du + v * dv, w)?;
+            }
+            let [x, y, z] = got;
+            out.set(a, b, V3 { x, y, z });
+        }
+    }
+    Ok(out)
+}
+
+/// [`nurbs_partials_over_piece`]'s direct enclosure: the homogeneous surface's Taylor
+/// polynomials at the box's middle, from exact point derivatives (it is of degree p, q
+/// there), then the rational quotient's (the NURBS book's A4.4) in intervals, about the
+/// point at the middle. A point box is enclosed to rounding.
+///
+/// # Errors
+///
+/// As [`nurbs_partials_over_piece`].
+#[allow(clippy::too_many_arguments)]
+fn nurbs_partials_direct(
     cn: &Nurbs,
     ku: usize,
     kv: usize,
@@ -332,6 +502,19 @@ pub fn nurbs_partials_over_piece(
             *hab = h;
         }
     }
+    // the quotient about c, the point at the middle (rounded; any c is exact)
+    let c = {
+        let [x, y, z, w] = at2(&hm, 0, 0, [IZ; 4]);
+        [x.mid() / w.mid(), y.mid() / w.mid(), z.mid() / w.mid()]
+    };
+    let c_finite = c.iter().all(|x| x.is_finite());
+    let c = if c_finite { c } else { [0.0; 3] };
+    for h in hm.iter_mut().flatten() {
+        let w = h[3];
+        for (he, &ce) in h.iter_mut().zip(&c) {
+            *he = *he - Ivl::from(ce) * w;
+        }
+    }
     let du = Ivl::new(ua, ub) - Ivl::from(um);
     let dv = Ivl::new(va, vb) - Ivl::from(vm);
     let mut pu = vec![IZ; la + 1];
@@ -359,10 +542,10 @@ pub fn nurbs_partials_over_piece(
             let mut h = [IZ; 4];
             for i in a..=la {
                 for j in b..=lb {
-                    let c = at1(&pu, i - a, IZ) * at1(&pv, j - b, IZ);
+                    let coeff = at1(&pu, i - a, IZ) * at1(&pv, j - b, IZ);
                     let hij = at2(&hm, i, j, [IZ; 4]);
                     for (he, &x) in h.iter_mut().zip(&hij) {
-                        *he = *he + x * c;
+                        *he = *he + x * coeff;
                     }
                 }
             }
@@ -399,11 +582,11 @@ pub fn nurbs_partials_over_piece(
                     if i == 0 && j == 0 {
                         continue;
                     }
-                    let c = Ivl::from(cka * cbj) * at2(&wv, i, j, IZ);
+                    let coeff = Ivl::from(cka * cbj) * at2(&wv, i, j, IZ);
                     let pij = out.at(a - i, b - j);
-                    v3.x = v3.x - c * pij.x;
-                    v3.y = v3.y - c * pij.y;
-                    v3.z = v3.z - c * pij.z;
+                    v3.x = v3.x - coeff * pij.x;
+                    v3.y = v3.y - coeff * pij.y;
+                    v3.z = v3.z - coeff * pij.z;
                 }
             }
             out.set(
@@ -417,6 +600,17 @@ pub fn nurbs_partials_over_piece(
             );
         }
     }
+    let [cx, cy, cz] = c;
+    let p00 = out.at(0, 0);
+    out.set(
+        0,
+        0,
+        V3 {
+            x: p00.x + Ivl::from(cx),
+            y: p00.y + Ivl::from(cy),
+            z: p00.z + Ivl::from(cz),
+        },
+    );
     Ok(out)
 }
 
@@ -637,14 +831,14 @@ fn f_at(x: &[f64; 4], i: usize) -> f64 {
 }
 
 /// The system over the partials `p` (`sSys` with `apP` at `asP`).
-fn system<'a>(
-    p: &'a [Partials<Ivl>; 2],
-    leader: &VSer<Ivl>,
-    tangent: &VSer<Ivl>,
+fn system<'a, T: GnScalar>(
+    p: &'a [Partials<T>; 2],
+    leader: &VSer<T>,
+    tangent: &VSer<T>,
     r: [f64; 2],
     side: [f64; 2],
-    law: Option<&'a Ser<Ivl>>,
-) -> GnSystem<'a, Ivl> {
+    law: Option<&'a Ser<T>>,
+) -> GnSystem<'a, T> {
     let [p0, p1] = p;
     GnSystem {
         p: [p0, p1],
@@ -882,6 +1076,536 @@ pub fn gn_enclose(
     gn_enclose_over(k, faces_n, leader_n, &at, r, side, n, order_s, law, defs)
 }
 
+/// The feet's series over `at.s` in affine forms ([`gn_enclose_over`]'s first enclosure).
+///
+/// Not upstream (#2690): the fork encloses the feet over S in one box and evaluates the
+/// system over it in plain intervals. The feet are a curve in s; a box treats their four
+/// parameters as free, and interval arithmetic adds the widths of the system's terms,
+/// which nearly cancel where the ball's offset nearly collapses (`S + r N`): the
+/// Jacobian's enclosure came out hundreds to thousands of times its range, and each
+/// Taylor coefficient, solved through the preconditioner from the ones before, widened by
+/// that factor again order by order (the sixth by 10^5 to 10^6 on #2406's plate), so
+/// Krawczyk's test failed on all but short spans and the certificate's bound, made of the
+/// top coefficient, subdivided for what was its own excess. Here every quantity is a
+/// first-order affine form ([`Aff`]) in the span's parameter, `s = m + rad e_4`, and the
+/// feet's residuals off their predicted line, `x = x^(s) + E`, `x^(s)` the line through
+/// the guesses at S's ends and E a box `|e_q| <= w_q`:
+///
+/// - the leader, its tangent and a radius law are their mean value forms in s
+///   ([`series_affine`]), the faces' partials their mean value forms over the region the
+///   feet range over ([`face_partials_affine`]);
+/// - Krawczyk's operator is taken for each s about `x^(s)`, with the preconditioner
+///   `Y(s) = Y0 - Y0 J1 Y0 (s - m) / rad`, the inverse of the Jacobian's middle to first
+///   order in s, so `C = I - Y J` is of the span's square and the box's size:
+///   `-Y G(x^(s)) + C E` inside E proves one root in `x^(s) + E` for every s;
+/// - each Taylor coefficient is the preconditioned solution's Neumann series to its
+///   second term, `x = a + C a + [-q^2 |a| / (1 - q), ...]`, `a = -Y R`, in the same forms:
+///   exact for every s but the tail.
+///
+/// A span on one point is the same with no s.
+///
+/// # Errors
+///
+/// `InvalidInput` when `order_s` or `n` exceeds the series' size.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn gn_enclose_affine(
+    k: &Kernel,
+    faces_n: [&Nurbs; 2],
+    leader_n: &NurbsCurve,
+    at: &SpanAt,
+    r: [f64; 2],
+    side: [f64; 2],
+    n: usize,
+    order_s: usize,
+    law: Option<&GnLaw<'_>>,
+    defs: Option<&mut GnDefs<'_>>,
+) -> Result<Option<Enclosure>> {
+    let s = at.s;
+    let tr = Trunc::new(order_s, n)?;
+    let sm = s.mid();
+    let rs = round_up(cmax(s.hi - sm, sm - s.lo));
+    let wider = Trunc::new(cmin_usize(order_s + 1, MAX_S), 0)?;
+    // a ball whose radius varies: its law over the span (0d43b4c), in s
+    let law_r = match law {
+        Some(l) => {
+            let wide = gn_try!(law_series_over(l, s, wider.s()), None);
+            let mid = gn_try!(law_series_over(l, Ivl::from(sm), order_s), None);
+            Some(series_affine(&mid, &wide, order_s, rs))
+        }
+        None => None,
+    };
+    let law_r = law_r.as_ref();
+    let (leader, tangent) = if at.piecewise && at.leader.is_none() {
+        // across the leader's knots: the pieces' hull, with no dependence on s
+        let (l, t) = gn_try!(leader_series_piecewise(leader_n, s, tr), None);
+        (vser_aff(&l), vser_aff(&t))
+    } else {
+        let piece = at
+            .leader
+            .or_else(|| Some(span(&leader_n.u, leader_n.p, leader_n.n, sm)));
+        let (lw, tw) = gn_try!(leader_series_over(leader_n, s, wider, piece), None);
+        let (lm, tm) = gn_try!(leader_series_over(leader_n, Ivl::from(sm), tr, piece), None);
+        (
+            vseries_affine(&lm, &lw, order_s, rs),
+            vseries_affine(&tm, &tw, order_s, rs),
+        )
+    };
+    let ax = |c: usize| at.xa.get(c).copied().unwrap_or(f64::NAN);
+    let bx = |c: usize| at.xb.get(c).copied().unwrap_or(f64::NAN);
+    // the feet's predicted line x^(s) = xm + g (s - m) / rad, through the guesses
+    let xm: [f64; 4] = core::array::from_fn(|c| 0.5 * (ax(c) + bx(c)));
+    // a face whose partials have no form (a definition's, or a box across a knot line
+    // taken piecewise) moves along the line only in intervals: there the feet are a box
+    // about the middle, as the fork's
+    let any_def = defs
+        .as_ref()
+        .is_some_and(|d| d.faces.iter().any(Option::is_some));
+    let tube = rs > 0.0 && !at.piecewise && !any_def;
+    let slope: [f64; 4] = core::array::from_fn(|c| if tube { 0.5 * (bx(c) - ax(c)) } else { 0.0 });
+    let feet = |w: &[f64; 4]| -> [Aff; 4] {
+        core::array::from_fn(|q| {
+            let mut g = [0.0; NOISE];
+            if let Some(gs) = g.get_mut(S_NOISE) {
+                *gs = f_at(&slope, q);
+            }
+            if let Some(gq) = g.get_mut(q) {
+                *gq = f_at(w, q);
+            }
+            Aff {
+                c: f_at(&xm, q),
+                g,
+                r: 0.0,
+            }
+        })
+    };
+    let [ku0, ku1] = at.ku;
+    let [kv0, kv1] = at.kv;
+    let mut defs = defs;
+    let mut partials_over = |x: &[Aff; 4], lk: usize| -> Result<[Partials<Aff>; 2]> {
+        let [n0, n1] = faces_n;
+        let [x0, x1, x2, x3] = *x;
+        let (d0, d1) = match defs.as_deref_mut() {
+            Some(d) => {
+                let [a0, a1] = &mut d.faces;
+                (a0.as_mut(), a1.as_mut())
+            }
+            None => (None, None),
+        };
+        let piecewise = at.piecewise && d0.is_none() && d1.is_none();
+        Ok([
+            face_partials_affine(k, n0, d0, piecewise, [ku0, kv0], [x0, x1], lk)?,
+            face_partials_affine(k, n1, d1, piecewise, [ku1, kv1], [x2, x3], lk)?,
+        ])
+    };
+    let consts = |x: &[Aff; 4]| -> [Ser<Aff>; 4] { x.map(Ser::constant) };
+    // the preconditioner Y(s) = Y0 + Y1 e_4 from a Jacobian's middle and its slope in s
+    let precondition = |jac: &[[Aff; 4]; 4]| -> Result<[[Aff; 4]; 4]> {
+        let j0 = jac.map(|row| row.map(|x| x.c));
+        let j1 = jac.map(|row| row.map(|x| x.g.get(S_NOISE).copied().unwrap_or(0.0)));
+        let y0 = inverse4(&j0)?;
+        let at = |m: &[[f64; 4]; 4], i: usize, j: usize| {
+            m.get(i).and_then(|r| r.get(j)).copied().unwrap_or(f64::NAN)
+        };
+        let mul = |a: &[[f64; 4]; 4], b: &[[f64; 4]; 4]| -> [[f64; 4]; 4] {
+            core::array::from_fn(|i| {
+                core::array::from_fn(|j| (0..4).map(|l| at(a, i, l) * at(b, l, j)).sum::<f64>())
+            })
+        };
+        let y1 = mul(&mul(&y0, &j1), &y0);
+        Ok(core::array::from_fn(|i| {
+            core::array::from_fn(|j| {
+                let mut g = [0.0; NOISE];
+                if let Some(gs) = g.get_mut(S_NOISE) {
+                    *gs = -at(&y1, i, j);
+                }
+                Aff {
+                    c: at(&y0, i, j),
+                    g,
+                    r: 0.0,
+                }
+            })
+        }))
+    };
+    // C = I - Y J and its largest row sum over every s and residual
+    let contraction = |y: &[[Aff; 4]; 4], jac: &[[Aff; 4]; 4]| -> ([[Aff; 4]; 4], f64) {
+        let mut c = [[Aff::point(0.0); 4]; 4];
+        let mut q = 0.0_f64;
+        for (i, (yi, ci)) in y.iter().zip(c.iter_mut()).enumerate() {
+            let mut row = 0.0_f64;
+            for (j, cij) in ci.iter_mut().enumerate() {
+                let mut v = Aff::point(if i == j { 1.0 } else { 0.0 });
+                for (&yil, jl) in yi.iter().zip(jac) {
+                    v = v - yil * jl.get(j).copied().unwrap_or(Aff::WHOLE);
+                }
+                *cij = v;
+                row = round_up(row + v.ivl().mag());
+            }
+            q = cmax(q, row);
+        }
+        (c, q)
+    };
+    let times = |m: &[[Aff; 4]; 4], v: &[Aff; 4]| -> [Aff; 4] {
+        core::array::from_fn(|i| {
+            let mut a = Aff::point(0.0);
+            if let Some(mi) = m.get(i) {
+                for (&mij, &vj) in mi.iter().zip(v) {
+                    a = a + mij * vj;
+                }
+            }
+            a
+        })
+    };
+
+    // G along the predicted line, for every s in the span
+    let point = Trunc::new(0, 0)?;
+    let line = feet(&[0.0; 4]);
+    let gl = {
+        let pc = gn_try!(partials_over(&line, 2), None);
+        let (g, _) = gn_try!(
+            gn_evaluate(
+                &system(&pc, &leader, &tangent, r, side, law_r),
+                &consts(&line),
+                point
+            ),
+            None
+        );
+        g.map(|x| x.at(0, 0))
+    };
+    // Krawczyk's operator about the line: the residual E from the guesses' spread
+    // (about the line the guesses lie on it; about the middle, as the fork's box, twice
+    // their spread, which they lie inside)
+    let mut w: [f64; 4] = core::array::from_fn(|c| {
+        let spread = 0.5 * (bx(c) - ax(c)).abs() + 1.0e-9 * (1.0 + f_at(&xm, c).abs());
+        if tube {
+            spread
+        } else {
+            2.0 * spread
+        }
+    });
+    let mut proved: Option<[[Aff; 4]; 4]> = None;
+    let mut it = 0;
+    while it < 8 && proved.is_none() {
+        it += 1;
+        let x = feet(&w);
+        let pb = gn_try!(partials_over(&x, 2), None);
+        let jac = gn_try!(
+            gn_jacobian(&system(&pb, &leader, &tangent, r, side, law_r), &consts(&x)),
+            None
+        );
+        let y = gn_try!(precondition(&jac), None);
+        let (c, q) = contraction(&y, &jac);
+        let d = times(&y, &gl).map(|v| Aff::point(0.0) - v);
+        let e: [Aff; 4] = core::array::from_fn(|j| {
+            let mut g = [0.0; NOISE];
+            if let Some(gj) = g.get_mut(j) {
+                *gj = f_at(&w, j);
+            }
+            Aff { c: 0.0, g, r: 0.0 }
+        });
+        let ce = times(&c, &e);
+        let mut inside = q < 1.0;
+        let mut kw = [0.0_f64; 4];
+        for (q_, ((di, ci), kq)) in d.iter().zip(&ce).zip(kw.iter_mut()).enumerate() {
+            let kk = (*di + *ci).ivl();
+            *kq = cmax(kk.lo.abs(), kk.hi.abs());
+            let wq = f_at(&w, q_);
+            if !(kk.lo > -wq && kk.hi < wq) {
+                inside = false;
+            }
+        }
+        if inside {
+            // the root's residual lies in K: its radius bounds it
+            w = kw;
+            proved = Some(y);
+        } else {
+            let contracts = q < 1.0;
+            if !contracts {
+                return Ok(None); // the span is too long for its Jacobian to be one preconditioner's
+            }
+            // the next residual box from the contraction: K's radii are at most d + |C| w,
+            // so the box of radii w = (I - |C|)^-1 d holds its K; a half more, to clear
+            // rounding and the change of C with the box
+            let dm = d.map(|v| v.ivl().mag());
+            let cmag = c.map(|row| row.map(|v| v.ivl().mag()));
+            let mut wn = dm;
+            for _ in 0..200 {
+                let mut nx = [0.0_f64; 4];
+                for ((nxi, &di), ci) in nx.iter_mut().zip(&dm).zip(&cmag) {
+                    *nxi = di;
+                    for (cij, &wj) in ci.iter().zip(&wn) {
+                        *nxi += cij * wj;
+                    }
+                }
+                wn = nx;
+            }
+            for ((wq, &wi), &mi) in w.iter_mut().zip(&wn).zip(&xm) {
+                let rr = 1.5 * wi + 1.0e-12 * (1.0 + mi.abs());
+                if !rr.is_finite() {
+                    return Ok(None);
+                }
+                *wq = rr;
+            }
+        }
+    }
+    let Some(y) = proved else {
+        return Ok(None);
+    };
+
+    // the feet's Taylor coefficients over the span, order by order: J x = -R, so
+    // x = a + C x, a = -Y R, C = I - Y J, whose Neumann series to its second term holds x
+    // with its tail, |C^2 a + C^3 a + ...| <= q^2 |a| / (1 - q)
+    // the partials the series take, and the Jacobian's second ones
+    let lk = cmax_usize(tr.s() + tr.e() + 1, 2);
+    let x0 = feet(&w);
+    let pk = gn_try!(partials_over(&x0, lk), None);
+    let sysk = system(&pk, &leader, &tangent, r, side, law_r);
+    let mut sx = consts(&x0);
+    let jk = gn_try!(gn_jacobian(&sysk, &sx), None);
+    let (ck, qk) = contraction(&y, &jk);
+    // 1 - q rounded down: the quotient rounded up is then at least the exact one
+    let gap = round_down(1.0 - qk);
+    if !gap.is_finite() || gap <= 0.0 {
+        return Ok(None);
+    }
+    for tot in 1..=(tr.s() + tr.e()) {
+        // the coefficients of total order tot take G's to that order in each variable
+        // only: a truncated series' coefficients below its truncation are the full one's
+        let to = Trunc::new(cmin_usize(tr.s(), tot), cmin_usize(tr.e(), tot))?;
+        let (sg, _) = gn_try!(gn_evaluate(&sysk, &sx, to), None);
+        for i in 0..=cmin_usize(tr.s(), tot) {
+            let k = tot - i;
+            // the section's jets of order n are the face curve's (gn_top_jets, 3bc54a4)
+            if k > tr.e() || (n >= 1 && k >= n) {
+                continue;
+            }
+            let rk: [Aff; 4] =
+                core::array::from_fn(|q| sg.get(q).map_or(Aff::WHOLE, |g| g.at(i, k)));
+            let a = times(&y, &rk).map(|v| Aff::point(0.0) - v);
+            let amax = a.iter().fold(0.0_f64, |m, v| cmax(m, v.ivl().mag()));
+            let tail = round_up(round_up(qk * qk) * amax / gap);
+            if !tail.is_finite() {
+                return Ok(None);
+            }
+            let ca = times(&ck, &a);
+            for ((sxq, &aq), &caq) in sx.iter_mut().zip(&a).zip(&ca) {
+                sxq.set(i, k, (aq + caq).widened(tail));
+            }
+        }
+    }
+    let (_, mut f, v, nrm) = gn_try!(gn_evaluate_vn(&sysk, &sx, tr), None);
+    gn_top_jets(n, tr, &nrm, &mut f);
+    // the faces' first partials over the region: |S_u| |du| + |S_v| |dv| bounds |dS| for
+    // a uv step (du, dv) (#2690: kept apart, where the fork sums them)
+    let mut ds = [[0.0_f64; 2]; 2];
+    let mut ds_lo = [[0.0_f64; 2]; 2];
+    for ((dsf, dsl), pf) in ds.iter_mut().zip(ds_lo.iter_mut()).zip(&pk) {
+        let su = v3_ivl(pf.at(1, 0));
+        let sv = v3_ivl(pf.at(0, 1));
+        let du = crate::geom::vector3d::sqrt(
+            su.x.mag() * su.x.mag() + su.y.mag() * su.y.mag() + su.z.mag() * su.z.mag(),
+        );
+        let dv = crate::geom::vector3d::sqrt(
+            sv.x.mag() * sv.x.mag() + sv.y.mag() * sv.y.mag() + sv.z.mag() * sv.z.mag(),
+        );
+        *dsf = [du, dv];
+        let lu = crate::geom::vector3d::sqrt(
+            su.x.mig() * su.x.mig() + su.y.mig() * su.y.mig() + su.z.mig() * su.z.mig(),
+        );
+        let lv = crate::geom::vector3d::sqrt(
+            sv.x.mig() * sv.x.mig() + sv.y.mig() * sv.y.mig() + sv.z.mig() * sv.z.mig(),
+        );
+        *dsl = [lu, lv];
+    }
+    let [f0, f1] = &f;
+    Ok(Some(Enclosure {
+        f: [vser_ivl(f0), vser_ivl(f1)],
+        x: sx.map(|x| ser_ivl(&x)),
+        ds,
+        ds_lo,
+        v: vser_ivl(&v),
+    }))
+}
+
+/// A series in sigma over a span, `s = m + rad e_4`, as affine forms in s: each
+/// coefficient `c_j` in its mean value form `c_j(m) + (j + 1) c_(j+1)(S) (s - m)` (the
+/// coefficients of a Taylor series at s have `d c_j / ds = (j + 1) c_(j+1)`), from the
+/// series at the middle (`mid`) and over the span (`wide`, one order more where the series
+/// holds it; the top coefficient past that is its enclosure over the span).
+fn series_affine(mid: &Ser<Ivl>, wide: &Ser<Ivl>, order: usize, rad: f64) -> Ser<Aff> {
+    let mut out = Ser::constant(Aff::point(0.0));
+    let mut ds = [0.0; NOISE];
+    if let Some(g) = ds.get_mut(S_NOISE) {
+        *g = rad;
+    }
+    let dev = Aff {
+        c: 0.0,
+        g: ds,
+        r: 0.0,
+    };
+    for j in 0..=order {
+        let c = if j < MAX_S {
+            let slope = Ivl::from((j + 1) as f64) * wide.at(j + 1, 0);
+            Aff::mean_value(mid.at(j, 0), &[(slope, dev)])
+        } else {
+            Aff::of_ivl(wide.at(j, 0))
+        };
+        out.set(j, 0, c);
+    }
+    out
+}
+
+/// [`series_affine`] for a vector series.
+fn vseries_affine(mid: &VSer<Ivl>, wide: &VSer<Ivl>, order: usize, rad: f64) -> VSer<Aff> {
+    let [m0, m1, m2] = &mid.a;
+    let [w0, w1, w2] = &wide.a;
+    VSer {
+        a: [
+            series_affine(m0, w0, order, rad),
+            series_affine(m1, w1, order, rad),
+            series_affine(m2, w2, order, rad),
+        ],
+    }
+}
+
+/// A series of intervals as affine forms with no dependence on the noise.
+fn ser_aff(s: &Ser<Ivl>) -> Ser<Aff> {
+    Ser {
+        c: s.c.map(|row| row.map(Aff::of_ivl)),
+    }
+}
+
+/// [`ser_aff`] for a vector series.
+fn vser_aff(v: &VSer<Ivl>) -> VSer<Aff> {
+    VSer {
+        a: v.a.map(|s| ser_aff(&s)),
+    }
+}
+
+/// The intervals a series of affine forms ranges over.
+fn ser_ivl(s: &Ser<Aff>) -> Ser<Ivl> {
+    Ser {
+        c: s.c.map(|row| row.map(|x| x.ivl())),
+    }
+}
+
+/// [`ser_ivl`] for a vector series.
+fn vser_ivl(v: &VSer<Aff>) -> VSer<Ivl> {
+    VSer {
+        a: v.a.map(|s| ser_ivl(&s)),
+    }
+}
+
+/// The intervals a vector of affine forms ranges over.
+fn v3_ivl(v: V3<Aff>) -> V3<Ivl> {
+    V3 {
+        x: v.x.ivl(),
+        y: v.y.ivl(),
+        z: v.z.ivl(),
+    }
+}
+
+/// Partials enclosed in intervals as affine forms with no dependence on the noise.
+fn partials_aff(p: &Partials<Ivl>, lk: usize) -> Partials<Aff> {
+    let mut out = Partials::default();
+    for a in 0..=lk {
+        for b in 0..=(lk - a) {
+            let x = p.at(a, b);
+            out.set(
+                a,
+                b,
+                V3 {
+                    x: Aff::of_ivl(x.x),
+                    y: Aff::of_ivl(x.y),
+                    z: Aff::of_ivl(x.z),
+                },
+            );
+        }
+    }
+    out
+}
+
+/// A face's partials `P[a][b]`, `a + b <= lk`, at its foot `(u, v)`, given as affine forms
+/// (`uv`), as affine forms: on one polynomial piece, their mean value forms `P_ab(m) +
+/// P_(a+1)b(B) (u - m_u) + P_a(b+1)(B) (v - m_v)` about the forms' middles m, the partials
+/// at m on that point and the next order's over the box B the forms range over
+/// ([`nurbs_partials_over_piece`]). A face that is a blend by its definition, and a box
+/// across a knot line of a face taken piecewise (`piecewise`,
+/// [`nurbs_partials_over_box`]), are their interval enclosures over B, with no dependence
+/// on the noise.
+///
+/// # Errors
+///
+/// Those of the enclosures.
+pub(crate) fn face_partials_affine(
+    k: &Kernel,
+    cn: &Nurbs,
+    def: Option<&mut GnDefFace<'_>>,
+    piecewise: bool,
+    piece: [usize; 2],
+    uv: [Aff; 2],
+    lk: usize,
+) -> Result<Partials<Aff>> {
+    let [ku, kv] = piece;
+    let [fu, fv] = uv;
+    let (bu, bv) = (fu.ivl(), fv.ivl());
+    if let Some(d) = def {
+        let p = definition_partials_over_box(k, d, cn, ku, kv, bu.lo, bu.hi, bv.lo, bv.hi, lk)?;
+        return Ok(partials_aff(&p, lk));
+    }
+    let (ku, kv) = if piecewise {
+        let us = knot_cuts(&cn.u, cn.p, cn.nu, bu.lo, bu.hi, FEET_BOX_CONTINUITY)?;
+        let vs = knot_cuts(&cn.v, cn.q, cn.nv, bv.lo, bv.hi, FEET_BOX_CONTINUITY)?;
+        if let ([(_, _, a)], [(_, _, b)]) = (us.as_slice(), vs.as_slice()) {
+            (*a, *b)
+        } else {
+            let p =
+                nurbs_partials_over_box(cn, bu.lo, bu.hi, bv.lo, bv.hi, lk, FEET_BOX_CONTINUITY)?;
+            return Ok(partials_aff(&p, lk));
+        }
+    } else {
+        (ku, kv)
+    };
+    let mid = nurbs_partials_direct(cn, ku, kv, fu.c, fu.c, fv.c, fv.c, lk)?;
+    let point = bu.lo >= bu.hi && bv.lo >= bv.hi;
+    if point {
+        return Ok(partials_aff(&mid, lk));
+    }
+    if lk >= MAX_K {
+        let p = nurbs_partials_over_piece(cn, ku, kv, bu.lo, bu.hi, bv.lo, bv.hi, lk)?;
+        return Ok(partials_aff(&p, lk));
+    }
+    let wide = nurbs_partials_over_piece(cn, ku, kv, bu.lo, bu.hi, bv.lo, bv.hi, lk + 1)?;
+    let du = fu - Aff::point(fu.c);
+    let dv = fv - Aff::point(fv.c);
+    let mut out = Partials::default();
+    for a in 0..=lk {
+        for b in 0..=(lk - a) {
+            let (m, pu, pv) = (mid.at(a, b), wide.at(a + 1, b), wide.at(a, b + 1));
+            let form = |m: Ivl, su: Ivl, sv: Ivl| Aff::mean_value(m, &[(su, du), (sv, dv)]);
+            out.set(
+                a,
+                b,
+                V3 {
+                    x: form(m.x, pu.x, pv.x),
+                    y: form(m.y, pu.y, pv.y),
+                    z: form(m.z, pu.z, pv.z),
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// The larger of two orders.
+#[inline]
+fn cmax_usize(a: usize, b: usize) -> usize {
+    if a < b {
+        b
+    } else {
+        a
+    }
+}
+
 /// `sm_GnEncloseOver` (c5b6bb7): the feet's series over `at.s`, to order `order_s` in s and
 /// `n` in tau, enclosed; `None` where Krawczyk's test fails on S (or an evaluation fails:
 /// nothing is proved). The centre's residual is evaluated once: the iterations keep the
@@ -901,9 +1625,34 @@ pub fn gn_enclose_over(
     n: usize,
     order_s: usize,
     law: Option<&GnLaw<'_>>,
-    defs: Option<&mut GnDefs<'_>>,
+    mut defs: Option<&mut GnDefs<'_>>,
 ) -> Result<Option<Enclosure>> {
     crate::profile::profile_scope!(k, "blend::certificate::gn_enclose_over");
+    // Along a tube (both faces' partials are forms, the span is not a point) the affine
+    // enclosure cancels the system's first-order dependence on the feet and on s, and is
+    // the tighter one. A face that is itself a blend, or a box taken piecewise, keeps the
+    // plain intervals (#2690).
+    let any_def = defs
+        .as_ref()
+        .is_some_and(|d| d.faces.iter().any(Option::is_some));
+    let tube = at.s.hi > at.s.lo && !at.piecewise && !any_def;
+    if tube {
+        let affine = gn_enclose_affine(
+            k,
+            faces_n,
+            leader_n,
+            at,
+            r,
+            side,
+            n,
+            order_s,
+            law,
+            defs.as_deref_mut(),
+        )?;
+        if affine.is_some() {
+            return Ok(affine);
+        }
+    }
     let s = at.s;
     let tr = Trunc::new(order_s, n)?;
     // a ball whose radius varies: its law over the span (0d43b4c)
@@ -2318,6 +3067,233 @@ mod tests {
         (best.1, best.2)
     }
 
+    /// A rational face's partials over a box are enclosed as tightly wherever the face
+    /// lies (#2690): the cylinder r 3 at the origin and the same cylinder moved 1000 away,
+    /// over the same box of their nets, have enclosures of the same widths, which hold the
+    /// partials' sampled values and shrink with the box. The quotient `P = A / w` taken in
+    /// intervals on the homogeneous coordinates as they stand widens with the point's
+    /// distance from the origin, `|P| |dw| / w`, however small the box.
+    #[test]
+    fn a_rational_face_s_box_enclosure_does_not_widen_with_its_distance() {
+        let k = Kernel::default();
+        let cylinder = |at: Vec3| {
+            let mut c = Cone::new_cylinder_bounded(
+                at,
+                Vec3::X,
+                Vec3::Y,
+                3.0,
+                0.0,
+                360.0,
+                10.0,
+                false,
+                false,
+                false,
+            );
+            c.make_nurb(&k).unwrap();
+            nurbs(&k, &Surface::from(c))
+        };
+        let near = cylinder(Vec3::new(0.0, 0.0, -2.0));
+        let far = cylinder(Vec3::new(1000.0, 500.0, -2.0));
+        let lk = 3;
+        // a box inside one piece of the net, off its middle
+        let ku = span(
+            &near.u,
+            near.p,
+            near.nu,
+            0.5 * (near.u[near.p] + near.u[near.p + 1]),
+        );
+        let kv = span(
+            &near.v,
+            near.q,
+            near.nv,
+            0.5 * (near.v[near.q] + near.v[near.q + 1]),
+        );
+        let (u0, u1) = (near.u[ku], near.u[ku + 1]);
+        let (v0, v1) = (near.v[kv], near.v[kv + 1]);
+        let (um, vm) = (u0 + 0.37 * (u1 - u0), v0 + 0.61 * (v1 - v0));
+        let mut widths = Vec::new();
+        for delta in [1e-2, 1e-3] {
+            let (du, dv) = (delta * (u1 - u0), delta * (v1 - v0));
+            let (ua, ub, va, vb) = (um - du, um + du, vm - dv, vm + dv);
+            let en = nurbs_partials_over_piece(&near, ku, kv, ua, ub, va, vb, lk).unwrap();
+            let ef = nurbs_partials_over_piece(&far, ku, kv, ua, ub, va, vb, lk).unwrap();
+            for a in 0..=lk {
+                for b in 0..=(lk - a) {
+                    // the partial's range over the box, sampled on a grid
+                    let mut lo = [f64::INFINITY; 3];
+                    let mut hi = [f64::NEG_INFINITY; 3];
+                    for i in 0..=8 {
+                        for j in 0..=8 {
+                            let u = ua + (ub - ua) * f64::from(i) / 8.0;
+                            let v = va + (vb - va) * f64::from(j) / 8.0;
+                            let x = nurbs_partials::<f64>(&near, ku, kv, u, v, lk).at(a, b);
+                            for (c, xc) in [x.x, x.y, x.z].into_iter().enumerate() {
+                                lo[c] = lo[c].min(xc);
+                                hi[c] = hi[c].max(xc);
+                            }
+                        }
+                    }
+                    let (pn, pf) = (en.at(a, b), ef.at(a, b));
+                    let comps = [(pn.x, pf.x), (pn.y, pf.y), (pn.z, pf.z)];
+                    for (c, (n, f)) in comps.into_iter().enumerate() {
+                        let (wn, wf) = (n.hi - n.lo, f.hi - f.lo);
+                        // rounding: the far face's coordinates are 1000 times as large
+                        let floor = 1e-9 * (1.0 + hi[c].abs().max(lo[c].abs()));
+                        assert!(
+                            wf <= 2.0 * wn + floor,
+                            "P[{a}][{b}].{c} at {delta}: far {wf:e}, near {wn:e}"
+                        );
+                        assert!(n.lo <= lo[c] && hi[c] <= n.hi, "P[{a}][{b}].{c}");
+                        widths.push(wn);
+                    }
+                }
+            }
+        }
+        // a tenth of the box, at most a fifth of the width (first order, and rounding)
+        let (wide, narrow) = widths.split_at(widths.len() / 2);
+        for (w1, w2) in wide.iter().zip(narrow) {
+            assert!(*w2 <= 0.2 * w1 + 1e-12, "{w2:e} against {w1:e}");
+        }
+        // the same for a rational curve: the circle r 3, at the origin and 1000 away
+        let circle = |at: Vec3| {
+            let frame = Axis2Placement::new(at, Vec3::X, Vec3::Y);
+            let c = BSplineCurve::create_circle_segment(
+                3,
+                &frame,
+                3.0,
+                10.0,
+                80.0,
+                NurbCircleParam::Quadratic,
+            )
+            .unwrap();
+            NurbsCurve::of(&c).unwrap()
+        };
+        let (cn, cf) = (circle(Vec3::ZERO), circle(Vec3::new(1000.0, 500.0, 0.0)));
+        let piece = span(&cn.u, cn.p, cn.n, 0.5 * (cn.u[cn.p] + cn.u[cn.p + 1]));
+        let (s0, s1) = (cn.u[piece], cn.u[piece + 1]);
+        let sm = s0 + 0.37 * (s1 - s0);
+        for delta in [1e-2, 1e-3] {
+            let ds = delta * (s1 - s0);
+            let s = Ivl::new(sm - ds, sm + ds);
+            let dn = curve_derivs_over(&cn, s, lk, Some(piece)).unwrap();
+            let df = curve_derivs_over(&cf, s, lk, Some(piece)).unwrap();
+            for (d, (n, f)) in dn.iter().zip(&df).enumerate() {
+                for (c, (n, f)) in [(n.x, f.x), (n.y, f.y), (n.z, f.z)].into_iter().enumerate() {
+                    let (wn, wf) = (n.hi - n.lo, f.hi - f.lo);
+                    let floor = 1e-9 * (1.0 + f.lo.abs().max(f.hi.abs()));
+                    assert!(
+                        wf <= 2.0 * wn + floor,
+                        "D[{d}].{c} at {delta}: far {wf:e}, near {wn:e}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A rational face's partials, and a rational curve's derivatives, over a box are
+    /// enclosed to within the box's square of their ranges (#2690): from a box of 1e-2 of a
+    /// piece to one of 1e-3, each enclosure's excess over its sampled range falls at least
+    /// thirtyfold (the square's hundredfold, less the sampling's). The direct quotient's
+    /// excess, the partial's size times w's spread, falls only tenfold: the cylinder's
+    /// partial along its axis is constant, its direct enclosure 7e-3 wide at 1e-2.
+    #[test]
+    fn a_rational_box_enclosure_exceeds_its_range_by_the_box_s_square() {
+        let k = Kernel::default();
+        let mut c = Cone::new_cylinder_bounded(
+            Vec3::new(0.0, 0.0, -2.0),
+            Vec3::X,
+            Vec3::Y,
+            3.0,
+            0.0,
+            360.0,
+            10.0,
+            false,
+            false,
+            false,
+        );
+        c.make_nurb(&k).unwrap();
+        let n = nurbs(&k, &Surface::from(c));
+        let lk = 3;
+        let ku = span(&n.u, n.p, n.nu, 0.5 * (n.u[n.p] + n.u[n.p + 1]));
+        let kv = span(&n.v, n.q, n.nv, 0.5 * (n.v[n.q] + n.v[n.q + 1]));
+        let (u0, u1) = (n.u[ku], n.u[ku + 1]);
+        let (v0, v1) = (n.v[kv], n.v[kv + 1]);
+        let (um, vm) = (u0 + 0.37 * (u1 - u0), v0 + 0.61 * (v1 - v0));
+        let mut excess = Vec::new();
+        for delta in [1e-2, 1e-3] {
+            let (du, dv) = (delta * (u1 - u0), delta * (v1 - v0));
+            let (ua, ub, va, vb) = (um - du, um + du, vm - dv, vm + dv);
+            let e = nurbs_partials_over_piece(&n, ku, kv, ua, ub, va, vb, lk).unwrap();
+            for a in 0..=lk {
+                for b in 0..=(lk - a) {
+                    let mut lo = [f64::INFINITY; 3];
+                    let mut hi = [f64::NEG_INFINITY; 3];
+                    for i in 0..=16 {
+                        for j in 0..=16 {
+                            let u = ua + (ub - ua) * f64::from(i) / 16.0;
+                            let v = va + (vb - va) * f64::from(j) / 16.0;
+                            let x = nurbs_partials::<f64>(&n, ku, kv, u, v, lk).at(a, b);
+                            for (c, xc) in [x.x, x.y, x.z].into_iter().enumerate() {
+                                lo[c] = lo[c].min(xc);
+                                hi[c] = hi[c].max(xc);
+                            }
+                        }
+                    }
+                    let p = e.at(a, b);
+                    for (c, i) in [p.x, p.y, p.z].into_iter().enumerate() {
+                        assert!(i.lo <= lo[c] && hi[c] <= i.hi, "P[{a}][{b}].{c}");
+                        excess.push(((a, b, c), (i.hi - i.lo) - (hi[c] - lo[c])));
+                    }
+                }
+            }
+        }
+        let (wide, narrow) = excess.split_at(excess.len() / 2);
+        for ((at, e1), (_, e2)) in wide.iter().zip(narrow) {
+            assert!(*e2 <= e1 / 30.0 + 1e-12, "P{at:?}: {e2:e} against {e1:e}");
+        }
+        // the circle r 3 likewise, its derivatives over an interval of the parameter
+        let frame = Axis2Placement::new(Vec3::ZERO, Vec3::X, Vec3::Y);
+        let circle = BSplineCurve::create_circle_segment(
+            3,
+            &frame,
+            3.0,
+            10.0,
+            80.0,
+            NurbCircleParam::Quadratic,
+        )
+        .unwrap();
+        let cn = NurbsCurve::of(&circle).unwrap();
+        let piece = span(&cn.u, cn.p, cn.n, 0.5 * (cn.u[cn.p] + cn.u[cn.p + 1]));
+        let (s0, s1) = (cn.u[piece], cn.u[piece + 1]);
+        let sm = s0 + 0.37 * (s1 - s0);
+        let mut excess = Vec::new();
+        for delta in [1e-2, 1e-3] {
+            let ds = delta * (s1 - s0);
+            let d = curve_derivs_over(&cn, Ivl::new(sm - ds, sm + ds), lk, Some(piece)).unwrap();
+            for (o, dd) in d.iter().enumerate() {
+                let mut lo = [f64::INFINITY; 3];
+                let mut hi = [f64::NEG_INFINITY; 3];
+                for i in 0..=64 {
+                    let s = sm - ds + 2.0 * ds * f64::from(i) / 64.0;
+                    let x = circle.evaluate(s, lk, true, false).unwrap()[o];
+                    for (c, xc) in [x.x, x.y, x.z].into_iter().enumerate() {
+                        lo[c] = lo[c].min(xc);
+                        hi[c] = hi[c].max(xc);
+                    }
+                }
+                for (c, i) in [dd.x, dd.y, dd.z].into_iter().enumerate() {
+                    let slack = 1e-9 * (1.0 + lo[c].abs().max(hi[c].abs()));
+                    assert!(i.lo <= lo[c] + slack && hi[c] - slack <= i.hi, "D[{o}].{c}");
+                    excess.push(((o, c), (i.hi - i.lo) - (hi[c] - lo[c])));
+                }
+            }
+        }
+        let (wide, narrow) = excess.split_at(excess.len() / 2);
+        for ((at, e1), (_, e2)) in wide.iter().zip(narrow) {
+            assert!(*e2 <= e1 / 30.0 + 1e-9, "D{at:?}: {e2:e} against {e1:e}");
+        }
+    }
+
     /// A cylinder of radius R about z standing on the plane z = 0, the ball of radius r
     /// outside it: the centre line L(s) is the circle of radius R + r at height r (a
     /// rational quadratic arc), and the feet are `F1 = (L_xy (R + tau r) / (R + r), 0)` on
@@ -2334,8 +3310,8 @@ mod tests {
     /// pieces' maximum). The span's bounds are sound but loose (`m4[0][0]` about 36 times
     /// the closed form at h = 0.02: the series enclosed over an interval of s widen order
     /// by order, and the Taylor form's remainder carries that). A span five times as long
-    /// fails Krawczyk's test in one enclosure and is proved by the pieces, its bound again
-    /// finite, below the target and above the closed form's.
+    /// is proved in one enclosure, its bound again finite, below the target and above
+    /// the closed form's.
     #[test]
     fn cylinder_plane_span_bound_is_the_closed_form() {
         let k = Kernel::default();
@@ -2500,8 +3476,9 @@ mod tests {
                 .max(uv4[1]);
         assert!((bound - lvl0).abs() <= 1e-9 * lvl0, "{bound} {lvl0}");
 
-        // a span five times as long: one enclosure over it fails Krawczyk's test, the
-        // pieces prove it, and the bound still holds the closed form's
+        // a span five times as long. The centred partials and the affine feet prove it
+        // in one enclosure (the direct quotient's Krawczyk test did not), and the
+        // certified bound still holds the closed form's.
         let (lb, hl) = (st(0.5), 0.1);
         let mut l4l = 0.0_f64;
         for i in 0..=500 {
@@ -2524,7 +3501,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(one.is_none());
+        assert!(one.is_some(), "the longer span is proved in one enclosure");
         let long = gn_certify_span(
             &k,
             [&np, &nc],
